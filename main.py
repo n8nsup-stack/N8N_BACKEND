@@ -8,7 +8,7 @@ from supabase import create_client, Client
 from pydantic import BaseModel
 from typing import List, Optional
 
-app = FastAPI(title="OCR Gateway v3")
+app = FastAPI(title="OCR Gateway v3.1")
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
@@ -41,13 +41,13 @@ async def shutdown_event():
 def home():
     return {
         "status": "online",
-        "version": "v3",
+        "version": "v3.1",
         "mode": "bridge",
         "brain_target": HF_API_URL,
         "database_connected": supabase is not None,
         "standardized_variables": {
             "quota_metrics": ["total", "used", "remaining"],
-            "identifiers": ["outlet_code", "user_id", "report_id", "detected_phone"]
+            "identifiers": ["outlet_code", "outlet_name", "user_id", "report_id", "detected_phone"]
         }
     }
 
@@ -56,13 +56,14 @@ async def process_document(
     file: UploadFile = File(...),
     task_type: str = Form("quota"),
     outlet_code: Optional[str] = Form(None),
+    outlet_name: Optional[str] = Form(None),
     outlet_id: Optional[str] = Form(None)  # Backward-compatible alias
 ):
     """
-    v3: Multi-Provider Gateway
-    - Proxies document to HF OCR engine (v3)
-    - Receives standardized variables (total, used, remaining, detected_phone)
-    - Cross-references with historical reports in Supabase for single-card UIs (e.g. Bima+ Tri)
+    v3.1: Multi-Provider Gateway synced with updated Google Sheets & Supabase schema
+    - Supports outlet_code and outlet_name
+    - Proxies document to HF OCR engine (v3.1)
+    - Cross-references historical reports in Supabase for single-card UIs (e.g. Bima+ Tri)
     """
     if not HF_API_URL:
         raise HTTPException(status_code=500, detail="HF_API_URL is not configured.")
@@ -76,6 +77,7 @@ async def process_document(
     target_path = endpoint_map.get(task_type, "get-raw-ocr")
     target_url = f"{HF_API_URL}/{target_path}"
     effective_outlet = outlet_code or outlet_id
+    effective_outlet_name = outlet_name
 
     try:
         file_content = await file.read()
@@ -88,12 +90,15 @@ async def process_document(
         if task_type == "quota" and effective_outlet and supabase:
             try:
                 db_res = supabase.table("quota_reports").select(
-                    "total, used, remaining, outlet_code, created_at"
+                    "total, used, remaining, outlet_code, outlet_name, created_at"
                 ).eq("outlet_code", effective_outlet).order("created_at", desc=True).limit(1).execute()
 
                 last_report = db_res.data[0] if db_res.data else None
 
                 if last_report:
+                    if not effective_outlet_name:
+                        effective_outlet_name = last_report.get("outlet_name")
+
                     curr_rem = api_data.get("remaining")
                     prev_rem = last_report.get("remaining")
                     prev_tot = last_report.get("total")
@@ -101,25 +106,26 @@ async def process_document(
                     # If UI only shows remaining quota (e.g. Bima+) and total was not on screen,
                     # infer total from previous report if within reasonable range
                     if api_data.get("used") == 0.0 and prev_tot and curr_rem and prev_tot >= curr_rem:
-                        inferred_used = round(prev_tot - curr_rem, 2)
-                        api_data["total"] = prev_tot
+                        inferred_used = round(float(prev_tot) - float(curr_rem), 2)
+                        api_data["total"] = float(prev_tot)
                         api_data["used"] = inferred_used
-                        api_data["total_quota"] = prev_tot
+                        api_data["total_quota"] = float(prev_tot)
                         api_data["used_quota"] = inferred_used
 
                     verdict = "APPROVED (Valid quota report)"
                     is_valid = True
 
                     if prev_rem is not None and curr_rem is not None:
-                        if curr_rem > prev_rem:
+                        if float(curr_rem) > float(prev_rem):
                             verdict = "APPROVED (New billing cycle / Quota renewed or repurchased)"
-                        elif curr_rem == prev_rem:
+                        elif float(curr_rem) == float(prev_rem):
                             verdict = "WARNING (Identical remaining quota to previous submission)"
 
                     api_data["anti_cheat"] = {
                         "is_valid": is_valid,
                         "verdict": verdict,
                         "outlet_code": effective_outlet,
+                        "outlet_name": effective_outlet_name,
                         "previous_remaining": prev_rem,
                         "current_remaining": curr_rem,
                         "detected_phone": api_data.get("detected_phone")
@@ -128,6 +134,8 @@ async def process_document(
                     api_data["anti_cheat"] = {
                         "is_valid": True,
                         "verdict": "APPROVED (First time submission for this outlet)",
+                        "outlet_code": effective_outlet,
+                        "outlet_name": effective_outlet_name,
                         "detected_phone": api_data.get("detected_phone")
                     }
             except Exception as db_err:
@@ -135,6 +143,11 @@ async def process_document(
                     "is_valid": True,
                     "verdict": f"INFO (Database check skipped: {str(db_err)})"
                 }
+
+        if effective_outlet:
+            api_data["outlet_code"] = effective_outlet
+        if effective_outlet_name:
+            api_data["outlet_name"] = effective_outlet_name
 
         return api_data
     except Exception as e:
@@ -157,6 +170,7 @@ async def submit_report(
     file: UploadFile = File(...),
     report_id: str = Form(...),
     outlet_code: Optional[str] = Form(None),
+    outlet_name: Optional[str] = Form(None),
     outlet_id: Optional[str] = Form(None),               # Backward-compatible alias
     user_id: Optional[str] = Form(None),
     phone_number: Optional[str] = Form(None),          # Backward-compatible alias
@@ -166,8 +180,9 @@ async def submit_report(
     total: Optional[float] = Form(None)
 ):
     """
-    v3: Stores screenshot in Supabase storage and finalizes quota_reports record.
-    Supports both new standardized field names and legacy n8n aliases.
+    v3.1: Stores screenshot in Supabase storage and finalizes quota_reports record.
+    - Automatically resolves outlet_code and outlet_name from quota_reports / user_sessions
+      if not passed in form data from n8n.
     """
     if not supabase: 
         return {"status": "error", "message": "Database connection unavailable."}
@@ -175,16 +190,55 @@ async def submit_report(
     try:
         content = await file.read()
         
-        effective_outlet = outlet_code or outlet_id or "Unsorted"
-        effective_user = user_id or phone_number or "unknown"
+        effective_outlet = outlet_code or outlet_id
+        effective_outlet_name = outlet_name
+        effective_user = user_id or phone_number
         effective_used = used if used is not None else user_corrected_usage
+        effective_rem = remaining
+        effective_tot = total
+
+        # Auto-resolve outlet_code, outlet_name, and quota metrics from existing row if omitted in form
+        if report_id and (not effective_outlet or not effective_outlet_name or effective_rem is None or effective_tot is None):
+            try:
+                existing_rep = supabase.table("quota_reports").select(
+                    "outlet_code, outlet_name, user_id, total, used, remaining"
+                ).eq("id", report_id).limit(1).execute()
+                if existing_rep.data:
+                    row = existing_rep.data[0]
+                    effective_outlet = effective_outlet or row.get("outlet_code")
+                    effective_outlet_name = effective_outlet_name or row.get("outlet_name")
+                    effective_user = effective_user or row.get("user_id")
+                    if effective_rem is None:
+                        effective_rem = row.get("remaining")
+                    if effective_tot is None:
+                        effective_tot = row.get("total")
+                    if effective_used is None:
+                        effective_used = row.get("used")
+            except Exception:
+                pass
+
+        # Fallback lookup from user_sessions if still missing outlet info
+        if effective_user and (not effective_outlet or not effective_outlet_name):
+            try:
+                sess_res = supabase.table("user_sessions").select(
+                    "outlet_code, outlet_name"
+                ).eq("user_id", str(effective_user)).limit(1).execute()
+                if sess_res.data:
+                    s_row = sess_res.data[0]
+                    effective_outlet = effective_outlet or s_row.get("outlet_code")
+                    effective_outlet_name = effective_outlet_name or s_row.get("outlet_name")
+            except Exception:
+                pass
+
+        effective_outlet = effective_outlet or "Unsorted"
+        effective_user = effective_user or "unknown"
         
         current_time = time.localtime()
         year = time.strftime('%Y', current_time)
         week = time.strftime('%W', current_time)
         timestamp = int(time.time())
         
-        clean_folder = re.sub(r'[^a-zA-Z0-9_-]', '', effective_outlet)
+        clean_folder = re.sub(r'[^a-zA-Z0-9_-]', '', effective_outlet) or "Unsorted"
         filename = f"{timestamp}_{file.filename.replace(' ', '_')}"
         storage_path = f"Quota/{clean_folder}/{year}/Week_{week}/{filename}"
         
@@ -197,7 +251,7 @@ async def submit_report(
         url_resp = supabase.storage.from_("Screenshots").get_public_url(storage_path)
         final_url = url_resp if isinstance(url_resp, str) else url_resp.get("publicUrl")
 
-        # Standardized payload matching current Supabase schema
+        # Standardized payload matching v3.1 Supabase schema
         data_payload = {
             "image_url": final_url,
             "confirmation": True,                
@@ -212,17 +266,21 @@ async def submit_report(
             data_payload["total"] = total
         if effective_outlet != "Unsorted":
             data_payload["outlet_code"] = effective_outlet
+        if effective_outlet_name:
+            data_payload["outlet_name"] = effective_outlet_name
             
         db_response = supabase.table("quota_reports").update(data_payload).eq("id", report_id).execute()
         
         return {
             "status": "success", 
+            "version": "v3.1",
             "image_url": final_url, 
             "report_id": report_id,
             "outlet_code": effective_outlet,
+            "outlet_name": effective_outlet_name,
             "used": effective_used,
-            "remaining": remaining,
-            "total": total,
+            "remaining": effective_rem,
+            "total": effective_tot,
             "db_data": db_response.data
         }
         
